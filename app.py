@@ -2055,8 +2055,15 @@ def generate_squat_guide():
 # -----------------------------------------------------------------------------------
 # 15) 메인 애플리케이션 레이아웃
 # -----------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------
+# 15) 메인 애플리케이션 레이아웃
+# -----------------------------------------------------------------------------------
 def main():
     """메인 애플리케이션 레이아웃 및 상호작용 로직"""
+    # global 변수 선언을 함수 시작 부분으로 이동
+    global OPENAI_API_KEY
+    global client
+    
     print("Loading user information...")
     st.session_state.users = load_users()
     
@@ -2088,11 +2095,9 @@ def main():
         api_key = st.text_input("Enter OpenAI API Key", value=OPENAI_API_KEY, type="password")
         if api_key != OPENAI_API_KEY:
             os.environ["OPENAI_API_KEY"] = api_key
-            global OPENAI_API_KEY
             OPENAI_API_KEY = api_key
             # 새 API 키로 클라이언트 재초기화
             if openai_new_client:
-                global client
                 client = OpenAI(api_key=OPENAI_API_KEY)
             else:
                 import openai
@@ -2109,6 +2114,8 @@ def main():
         
         Ensure you have a valid OpenAI API key with access to GPT-4 and DALL-E 3.
         """)
+
+    # 나머지 코드는 동일하게 유지...
 
 
     # 탭 생성
