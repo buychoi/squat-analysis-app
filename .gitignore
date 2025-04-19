@@ -1,0 +1,11 @@
+pose_프로그램 사용법.mov
+*.mp4
+*.mov
+users/**/video/
+users/**/video_anno/
+.DS_Store
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
