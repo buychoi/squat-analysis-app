@@ -1,67 +1,215 @@
 import streamlit as st
-import cv2
-import mediapipe as mp
-import numpy as np
-import csv
+import os
+import sys
+import platform
 import datetime
 import time
-import os
-import platform
+import traceback
+import json
+import csv
+from io import BytesIO
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from PIL import Image
 import requests
-import json
-from io import BytesIO
-import traceback
-import sys
-from openai import OpenAI
+import numpy as np
+from pathlib import Path
+import importlib
 
-# Print debugging information
+# 환경 변수 관리 - dotenv 라이브러리가 있으면 로드
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("Environment variables loaded from .env file")
+except ImportError:
+    print("dotenv not installed, using environment variables directly")
+
+# 클라우드 환경 확인
+is_cloud_env = (
+    os.environ.get('IS_STREAMLIT_CLOUD') == 'True' or 
+    'STREAMLIT_SHARING_MODE' in os.environ or 
+    'DYNO' in os.environ or
+    os.environ.get('CLOUD_ENV') == 'True'
+)
+
+# 디버깅 정보 출력
 print(f"Python version: {sys.version}")
 print(f"Current working directory: {os.getcwd()}")
 print(f"Platform: {sys.platform}")
+print(f"Running in cloud environment: {is_cloud_env}")
+
+# 조건부로 시각화 라이브러리 임포트
+try:
+    import cv2
+    import mediapipe as mp
+    opencv_available = True
+    print("OpenCV and MediaPipe imported successfully")
+    # Mediapipe Setup
+    mp_drawing = mp.solutions.drawing_utils
+    mp_pose = mp.solutions.pose
+    mp_drawing_styles = mp.solutions.drawing_styles
+except ImportError as e:
+    opencv_available = False
+    print(f"OpenCV/MediaPipe import error: {e}")
+    # 호환성을 위한 더미 객체 생성
+    class DummyClass:
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+    
+    class DummySolutions:
+        def __init__(self):
+            self.drawing_utils = DummyClass()
+            self.pose = DummyClass()
+            self.drawing_styles = DummyClass()
+    
+    class DummyVideoCapture:
+        def __init__(self, *args, **kwargs):
+            pass
+        
+        def release(self):
+            pass
+            
+        def read(self):
+            return False, None
+            
+        def get(self, *args):
+            return 0
+    
+    cv2 = DummyClass()
+    cv2.VideoWriter_fourcc = lambda *args: 0
+    cv2.VideoWriter = DummyClass
+    cv2.VideoCapture = DummyVideoCapture
+    cv2.cvtColor = lambda *args, **kwargs: None
+    cv2.putText = lambda *args, **kwargs: None
+    cv2.imwrite = lambda *args, **kwargs: None
+    cv2.destroyAllWindows = lambda: None
+    
+    mp = DummySolutions()
+    mp_drawing = mp.drawing_utils
+    mp_pose = mp.pose
+    mp_drawing_styles = mp.drawing_styles
+
+# OpenAI API 설정
+try:
+    # 최신 방식의 OpenAI 클라이언트 임포트 시도
+    from openai import OpenAI
+    openai_available = True
+    openai_new_client = True
+    print("OpenAI client (new version) imported successfully")
+except ImportError:
+    try:
+        # 이전 버전 OpenAI 모듈 임포트 시도
+        import openai
+        openai_available = True
+        openai_new_client = False
+        print("OpenAI module (old version) imported successfully")
+    except ImportError:
+        openai_available = False
+        openai_new_client = False
+        print("OpenAI library import error")
+        # 더미 OpenAI 클라이언트 생성
+        class DummyOpenAI:
+            def __init__(self, api_key=None):
+                self.api_key = api_key
+                self.chat = DummyClass()
+                self.chat.completions = DummyClass()
+                self.images = DummyClass()
+                self.images.generate = DummyClass()
+        
+        class DummyCompletion:
+            @staticmethod
+            def create(*args, **kwargs):
+                class DummyChoices:
+                    class DummyMessage:
+                        content = "OpenAI API not available. Please provide a valid API key."
+                    
+                    class DummyChoice:
+                        def __init__(self):
+                            self.message = DummyChoices.DummyMessage()
+                    
+                    choices = [DummyChoice()]
+                
+                return DummyChoices()
+                
+        class DummyImage:
+            @staticmethod
+            def create(*args, **kwargs):
+                return {"data": [{"url": ""}]}
+        
+        if not openai_new_client:
+            openai = DummyClass()
+            openai.Completion = DummyCompletion
+            openai.ChatCompletion = DummyCompletion
+            openai.Image = DummyImage
+        
+        OpenAI = DummyOpenAI
+
+# 임시 파일 저장을 위한 방향
+def get_temp_dir():
+    """환경에 따라 적절한 임시 디렉토리 반환"""
+    if is_cloud_env:
+        # 클라우드 환경에서는 /tmp 사용
+        temp_dir = "/tmp/healthnai_app"
+    else:
+        # 로컬에서는 현재 디렉토리 아래 temp 폴더 사용
+        temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
+    
+    # 디렉토리가 없으면 생성
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
 
 # -----------------------------------------------------------------------------------
-# 1) Path Settings - Cross-platform compatible
+# 1) 경로 설정 - 크로스 플랫폼 호환
 # -----------------------------------------------------------------------------------
-# Detect operating system
+# 운영체제 감지
 SYSTEM = platform.system()  # 'Windows', 'Darwin'(Mac), 'Linux'
 print(f"Operating system: {SYSTEM}")
 
-# Default base directory - set to your actual project path
-import os
+# 기본 디렉토리 설정
 DEFAULT_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 클라우드 환경에서의 디렉토리 처리 향상
+if is_cloud_env:
+    # Streamlit Cloud 환경에서는 임시 디렉토리 사용
+    DEFAULT_BASE_DIR = get_temp_dir()
+    print(f"Cloud environment detected, using temp directory: {DEFAULT_BASE_DIR}")
 
-# Set base directory in Streamlit session state
+# Streamlit 세션 상태에 기본 디렉토리 설정
 if 'base_dir' not in st.session_state:
     st.session_state.base_dir = DEFAULT_BASE_DIR
 
-# Debug output
+# 디버그 출력
 print(f"Base directory set to: {st.session_state.base_dir}")
 
-# Define required folder paths
-USERS_DIR = os.path.join(st.session_state.base_dir, "users")
-STANDARD_IMG_DIR = os.path.join(st.session_state.base_dir, "imagestandard")
-LOGO_PATH = os.path.join(st.session_state.base_dir, "logo", "healthnai_logo.png")
+# 필요한 폴더 경로 정의
+DATA_DIR = os.path.join(st.session_state.base_dir, "data")
+USERS_DIR = os.path.join(DATA_DIR, "users")
+STANDARD_IMG_DIR = os.path.join(DATA_DIR, "imagestandard")
+STATIC_DIR = os.path.join(DEFAULT_BASE_DIR, "static")
+LOGO_PATH = os.path.join(STATIC_DIR, "logo", "healthnai_logo.png")
 
+print(f"DATA_DIR: {DATA_DIR}")
 print(f"USERS_DIR: {USERS_DIR}")
 print(f"STANDARD_IMG_DIR: {STANDARD_IMG_DIR}")
+print(f"STATIC_DIR: {STATIC_DIR}")
 print(f"LOGO_PATH: {LOGO_PATH}")
 
-# Create directories
+# 디렉토리 생성
 os.makedirs(st.session_state.base_dir, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(USERS_DIR, exist_ok=True)
 os.makedirs(STANDARD_IMG_DIR, exist_ok=True)
+os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(LOGO_PATH), exist_ok=True)
 
-# Verify directories
+# 경로 확인
 required_paths = [
     st.session_state.base_dir,
+    DATA_DIR,
     USERS_DIR,
     STANDARD_IMG_DIR,
+    STATIC_DIR,
     os.path.dirname(LOGO_PATH)
 ]
 for path in required_paths:
@@ -71,27 +219,48 @@ for path in required_paths:
     else:
         print(f"Path verified: {path}")
 
+# 샘플 로고 생성 (없는 경우)
+if not os.path.exists(LOGO_PATH) and is_cloud_env:
+    try:
+        # 간단한 샘플 로고 생성
+        sample_logo = Image.new('RGB', (300, 100), color=(73, 109, 137))
+        
+        # 실행 중 PIL 모듈이 없는 경우 대비
+        try:
+            from PIL import ImageDraw
+            draw = ImageDraw.Draw(sample_logo)
+            draw.text((100, 40), "HealthnAI", fill=(255, 255, 255))
+        except ImportError:
+            pass
+            
+        os.makedirs(os.path.dirname(LOGO_PATH), exist_ok=True)
+        sample_logo.save(LOGO_PATH)
+        print(f"Sample logo created at: {LOGO_PATH}")
+    except Exception as e:
+        print(f"Failed to create sample logo: {e}")
+
 # -----------------------------------------------------------------------------------
-# 2) OpenAI API Setup
+# 2) OpenAI API 설정
 # -----------------------------------------------------------------------------------
-# Set your OpenAI API key here (or use environment variable)
-# Note: You should replace this with your valid OpenAI API key
-import os
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")  # Enter your valid API key here
+# 환경 변수에서 API 키 가져오기
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 print(f"OpenAI API key set: {'Yes' if OPENAI_API_KEY else 'No'}")
 
-# Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+# OpenAI 클라이언트 초기화
+if openai_available:
+    if openai_new_client:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        print("Initialized OpenAI client (new version)")
+    else:
+        openai.api_key = OPENAI_API_KEY
+        client = None
+        print("Initialized OpenAI module (old version)")
+else:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    print("Using dummy OpenAI client")
 
 # -----------------------------------------------------------------------------------
-# 3) Mediapipe Setup
-# -----------------------------------------------------------------------------------
-mp_drawing = mp.solutions.drawing_utils
-mp_pose = mp.solutions.pose
-mp_drawing_styles = mp.solutions.drawing_styles
-
-# -----------------------------------------------------------------------------------
-# 4) Page Configuration
+# 4) 페이지 설정
 # -----------------------------------------------------------------------------------
 st.set_page_config(
     page_title="AI Squat Analysis",
@@ -99,7 +268,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom styling
+# 커스텀 스타일링
 st.markdown("""
 <style>
     .block-container {
@@ -134,12 +303,15 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------------
-# 5) Video Codec Setup - Platform-specific support
+# 5) 비디오 코덱 설정 - 플랫폼별 지원
 # -----------------------------------------------------------------------------------
 def get_video_codec():
-    """Return appropriate video codec for the platform"""
+    """플랫폼에 적합한 비디오 코덱 반환"""
+    if not opencv_available:
+        return 0  # OpenCV를 사용할 수 없는 경우
+    
     if SYSTEM == 'Windows':
-        # Windows codec options to try
+        # Windows 코덱 옵션
         codecs_to_try = ['XVID', 'MJPG', 'H264', 'X264', 'WMV1']
         for codec in codecs_to_try:
             try:
@@ -149,12 +321,12 @@ def get_video_codec():
             except Exception as e:
                 print(f"Windows: {codec} codec failed: {str(e)}")
                 continue
-        # Fallback
+        # 폴백
         print("Windows: Using fallback MJPG codec")
         return cv2.VideoWriter_fourcc('M', 'J', 'P', 'G')
     else:  # Mac/Linux
         try:
-            codec_value = cv2.VideoWriter_fourcc(*'mp4v')  # Recommended for macOS
+            codec_value = cv2.VideoWriter_fourcc(*'mp4v')  # macOS 권장
             print(f"Mac/Linux: mp4v codec success ({codec_value})")
             return codec_value
         except Exception as e:
@@ -169,10 +341,10 @@ def get_video_codec():
                 return cv2.VideoWriter_fourcc('M', 'J', 'P', 'G')
 
 # -----------------------------------------------------------------------------------
-# 6) Session State Reset Function
+# 6) 세션 상태 초기화 함수
 # -----------------------------------------------------------------------------------
 def reset_session_state(keep_user=True):
-    """Reset session state variables (optionally keeping user data)"""
+    """세션 상태 변수 초기화 (선택적으로 사용자 데이터 유지)"""
     print(f"Starting session state reset (keep user: {keep_user})")
     current_user = None
     users = {}
@@ -207,7 +379,7 @@ def reset_session_state(keep_user=True):
     print("Session state reset complete")
 
 # -----------------------------------------------------------------------------------
-# 7) Initialize Global Session State
+# 7) 전역 세션 상태 초기화
 # -----------------------------------------------------------------------------------
 print("Initializing global session state")
 if "capture_running" not in st.session_state:
@@ -246,28 +418,28 @@ if "ai_analysis" not in st.session_state:
 if "generated_image" not in st.session_state:
     st.session_state.generated_image = None
 
-# Active tab management
+# 활성 탭 관리
 if "active_tab" not in st.session_state:
     st.session_state.active_tab = None
 
 print("Global session state initialization complete")
 
 # -----------------------------------------------------------------------------------
-# 8) Target Angles and Tolerance Settings
+# 8) 목표 각도 및 허용 오차 설정
 # -----------------------------------------------------------------------------------
 TARGET_ANGLES = {
-    'hip': 90.0,    # Target for hip angle in deep squat position (decreases from ~180° when standing)
-    'knee': 90.0,   # Target for knee angle in deep squat position (decreases from ~180° when standing)
-    'ankle': 25.0   # Target for ankle dorsiflexion angle (increases from ~10° when standing)
+    'hip': 90.0,    # 깊은 스쿼트 자세에서의 엉덩이 각도 목표 (서 있을 때 ~180°에서 감소)
+    'knee': 90.0,   # 깊은 스쿼트 자세에서의 무릎 각도 목표 (서 있을 때 ~180°에서 감소)
+    'ankle': 25.0   # 발목 배측굴곡 각도 목표 (서 있을 때 ~10°에서 증가)
 }
 TOLERANCE = 5.0  # ±5°
 print(f"Target angles set: Hip={TARGET_ANGLES['hip']}°, Knee={TARGET_ANGLES['knee']}°, Ankle={TARGET_ANGLES['ankle']}°, Tolerance={TOLERANCE}°")
 
 # -----------------------------------------------------------------------------------
-# 9) User Management Functions
+# 9) 사용자 관리 함수
 # -----------------------------------------------------------------------------------
 def create_user_folders(user_id):
-    """Create folder structure for a user"""
+    """사용자 폴더 구조 생성"""
     print(f"Creating user folders for: {user_id}")
     user_dir = os.path.join(USERS_DIR, user_id)
     
@@ -278,7 +450,7 @@ def create_user_folders(user_id):
         "video": os.path.join(user_dir, "video"),
         "video_anno": os.path.join(user_dir, "video_anno"),
         "results": os.path.join(user_dir, "results"),
-        "ai_images": os.path.join(user_dir, "ai_images")  # New folder for AI-generated images
+        "ai_images": os.path.join(user_dir, "ai_images")  # AI 생성 이미지용 새 폴더
     }
     
     for folder_name, folder_path in folders.items():
@@ -288,7 +460,7 @@ def create_user_folders(user_id):
     return folders
 
 def save_user_info(user_id, user_info):
-    """Save user info to JSON file"""
+    """사용자 정보를 JSON 파일로 저장"""
     print(f"Saving user info for: {user_id}")
     user_dir = os.path.join(USERS_DIR, user_id)
     os.makedirs(user_dir, exist_ok=True)
@@ -302,41 +474,47 @@ def save_user_info(user_id, user_info):
         print(f"Error saving user info: {str(e)}")
 
 def load_users():
-    """Load all registered users' info"""
+    """등록된 모든 사용자 정보 로드"""
     print("Loading user information")
     users = {}
     if os.path.exists(USERS_DIR):
-        user_dirs = [d for d in os.listdir(USERS_DIR) if os.path.isdir(os.path.join(USERS_DIR, d))]
-        print(f"  - Found {len(user_dirs)} user directories")
-        
-        for user_id in user_dirs:
-            user_dir = os.path.join(USERS_DIR, user_id)
-            if os.path.isdir(user_dir):
-                user_info_path = os.path.join(user_dir, "user_info.json")
-                if os.path.exists(user_info_path):
-                    try:
-                        with open(user_info_path, 'r', encoding='utf-8') as f:
-                            user_info = json.load(f)
-                            users[user_id] = user_info
-                            print(f"  - Loaded user: {user_id} ({user_info.get('name', 'Unknown')})")
-                    except Exception as e:
-                        print(f"  - Error loading user {user_id}: {str(e)}")
+        try:
+            user_dirs = [d for d in os.listdir(USERS_DIR) if os.path.isdir(os.path.join(USERS_DIR, d))]
+            print(f"  - Found {len(user_dirs)} user directories")
+            
+            for user_id in user_dirs:
+                user_dir = os.path.join(USERS_DIR, user_id)
+                if os.path.isdir(user_dir):
+                    user_info_path = os.path.join(user_dir, "user_info.json")
+                    if os.path.exists(user_info_path):
+                        try:
+                            with open(user_info_path, 'r', encoding='utf-8') as f:
+                                user_info = json.load(f)
+                                users[user_id] = user_info
+                                print(f"  - Loaded user: {user_id} ({user_info.get('name', 'Unknown')})")
+                        except Exception as e:
+                            print(f"  - Error loading user {user_id}: {str(e)}")
+        except Exception as e:
+            print(f"Error listing users directory: {str(e)}")
     
     print(f"User loading complete: {len(users)} users")
     return users
 
 def create_session_id():
-    """Generate a new session ID based on timestamp"""
+    """타임스탬프 기반 새 세션 ID 생성"""
     session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"New session ID created: {session_id}")
     return session_id
 
 # -----------------------------------------------------------------------------------
-# 10) OpenAI Functions
+# 10) OpenAI 함수
 # -----------------------------------------------------------------------------------
 def get_ai_analysis(angles, target_angles, tolerance):
-    """Get AI analysis of squat posture using OpenAI GPT-4"""
+    """OpenAI GPT-4를 사용한 스쿼트 자세 AI 분석"""
     print("Starting AI analysis request")
+    
+    if not openai_available or not OPENAI_API_KEY:
+        return "OpenAI API key not provided or OpenAI library not available. Please enter your API key in the sidebar."
     
     try:
         prompt = f"""
@@ -357,18 +535,32 @@ def get_ai_analysis(angles, target_angles, tolerance):
         """
         
         print("Sending request to OpenAI API...")
-        # Use the standard chat.completions API
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a professional exercise coach and squat posture analyst."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=1000
-        )
         
-        analysis = response.choices[0].message.content
+        if openai_new_client:
+            # 새 OpenAI 클라이언트 API 사용
+            response = client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are a professional exercise coach and squat posture analyst."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=1000
+            )
+            analysis = response.choices[0].message.content
+        else:
+            # 이전 OpenAI API 사용
+            response = openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are a professional exercise coach and squat posture analyst."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=1000
+            )
+            analysis = response.choices[0].message.content
+        
         print("AI analysis complete")
         return analysis
         
@@ -377,23 +569,35 @@ def get_ai_analysis(angles, target_angles, tolerance):
         return f"Error obtaining AI analysis: {str(e)}"
 
 def generate_dalle_image(prompt):
-    """Generate squat guidance image using DALL-E 3"""
+    """DALL-E 3을 사용한 스쿼트 가이드 이미지 생성"""
     print(f"Starting DALL-E image generation: {prompt[:50]}...")
+    
+    if not openai_available or not OPENAI_API_KEY:
+        return None, None
     
     try:
         st.info("Requesting image generation from OpenAI... this may take a moment.")
         print("Sending image generation request to OpenAI API...")
         
-        # Using the current images.generate API
-        response = client.images.generate(
-            model="dall-e-3",
-            prompt=prompt,
-            n=1,
-            size="1024x1024",
-            quality="standard"
-        )
+        if openai_new_client:
+            # 새 OpenAI 클라이언트 API 사용
+            response = client.images.generate(
+                model="dall-e-3",
+                prompt=prompt,
+                n=1,
+                size="1024x1024",
+                quality="standard"
+            )
+            image_url = response.data[0].url
+        else:
+            # 이전 OpenAI API 사용
+            response = openai.Image.create(
+                prompt=prompt,
+                n=1,
+                size="1024x1024"
+            )
+            image_url = response["data"][0]["url"]
         
-        image_url = response.data[0].url
         print(f"Image URL received: {image_url[:50]}...")
         
         image_response = requests.get(image_url, timeout=30)
@@ -415,10 +619,13 @@ def generate_dalle_image(prompt):
         return None, None
 
 # -----------------------------------------------------------------------------------
-# 11) Core Analysis Functions
+# 11) 핵심 분석 함수
 # -----------------------------------------------------------------------------------
 def cleanup_resources():
-    """Release all used resources"""
+    """사용된 모든 리소스 해제"""
+    if not opencv_available:
+        return
+        
     print("Starting resource cleanup")
     try:
         if hasattr(st.session_state, 'out_raw') and st.session_state.out_raw:
@@ -454,8 +661,8 @@ def cleanup_resources():
 
 def calculate_angle(a, b, c):
     """
-    Calculate angle between three points (a, b, c)
-    Returns angle in degrees
+    세 점(a, b, c) 사이의 각도 계산
+    각도를 도(degrees)로 반환
     """
     a = np.array(a)
     b = np.array(b)
@@ -506,23 +713,23 @@ def calculate_ankle_angle(ankle, knee):
     return dorsiflexion_angle
 
 def calculate_side_angles(landmarks, side="right"):
-    """Calculate angles for specified side of body"""
+    """지정된 신체 측면의 각도 계산"""
     angles = {}
     
-    # Select landmarks based on side
+    # 측면에 따른 랜드마크 선택
     if side == "right":
-        torso = landmarks[12]  # right shoulder
-        hip = landmarks[24]    # right hip
-        knee = landmarks[26]   # right knee
-        ankle = landmarks[28]  # right ankle
-    else:  # left side
-        torso = landmarks[11]  # left shoulder
-        hip = landmarks[23]    # left hip
-        knee = landmarks[25]   # left knee
-        ankle = landmarks[27]  # left ankle
+        torso = landmarks[12]  # 오른쪽 어깨
+        hip = landmarks[24]    # 오른쪽 엉덩이
+        knee = landmarks[26]   # 오른쪽 무릎
+        ankle = landmarks[28]  # 오른쪽 발목
+    else:  # 왼쪽
+        torso = landmarks[11]  # 왼쪽 어깨
+        hip = landmarks[23]    # 왼쪽 엉덩이
+        knee = landmarks[25]   # 왼쪽 무릎
+        ankle = landmarks[27]  # 왼쪽 발목
     
-    # Hip angle (torso-hip-knee) - this is measuring the front angle
-    # When standing, this is ~180°, decreases as person squats
+    # 엉덩이 각도 (몸통-엉덩이-무릎) - 앞쪽 각도 측정
+    # 서 있을 때 ~180°, 스쿼트 시 감소
     hip_angle = calculate_angle(
         [torso['x'], torso['y']],
         [hip['x'], hip['y']],
@@ -530,8 +737,8 @@ def calculate_side_angles(landmarks, side="right"):
     )
     angles['hip'] = hip_angle
     
-    # Knee angle (hip-knee-ankle) - this is measuring the back angle
-    # When standing, this is ~180°, decreases as person squats
+    # 무릎 각도 (엉덩이-무릎-발목) - 뒤쪽 각도 측정
+    # 서 있을 때 ~180°, 스쿼트 시 감소
     knee_angle = calculate_angle(
         [hip['x'], hip['y']],
         [knee['x'], knee['y']],
@@ -543,7 +750,7 @@ def calculate_side_angles(landmarks, side="right"):
     ankle_angle = calculate_ankle_angle(ankle, knee)
     angles['ankle'] = ankle_angle
     
-    # Calculate visibility scores for each joint
+    # 각 관절의 가시성 점수 계산
     angles['visibility'] = {
         'hip': (hip['visibility'] + knee['visibility'] + torso['visibility']) / 3,
         'knee': (hip['visibility'] + knee['visibility'] + ankle['visibility']) / 3,
@@ -554,35 +761,35 @@ def calculate_side_angles(landmarks, side="right"):
     return angles
 
 def determine_best_angles(right_angles, left_angles, landmarks):
-    """Determine which side's angles to use based on visibility, or average both sides."""
+    """가시성에 따라 어떤 측면의 각도를 사용할지 결정하거나, 양쪽 모두 평균."""
     final_angles = {}
     
-    # Visibility threshold
+    # 가시성 임계값
     VISIBILITY_THRESHOLD = 0.7
     
-    # Check overall visibility
+    # 전체 가시성 확인
     right_visible = right_angles['visibility']['overall'] > VISIBILITY_THRESHOLD
     left_visible = left_angles['visibility']['overall'] > VISIBILITY_THRESHOLD
     
-    # Determine which angles to use for each joint
+    # 각 관절에 대해 사용할 각도 결정
     for joint in ['hip', 'knee', 'ankle']:
         if right_visible and left_visible:
-            # Both sides visible - average them
+            # 양쪽 모두 가시적 - 평균화
             final_angles[joint] = (right_angles[joint] + left_angles[joint]) / 2
         elif right_visible:
-            # Only right side visible
+            # 오른쪽만 가시적
             final_angles[joint] = right_angles[joint]
         elif left_visible:
-            # Only left side visible
+            # 왼쪽만 가시적
             final_angles[joint] = left_angles[joint]
         else:
-            # Neither side has good visibility - use side with better visibility
+            # 양쪽 모두 가시성이 좋지 않음 - 더 나은 가시성의 쪽 사용
             if right_angles['visibility'][joint] >= left_angles['visibility'][joint]:
                 final_angles[joint] = right_angles[joint]
             else:
                 final_angles[joint] = left_angles[joint]
     
-    # Store which side was used for visualization
+    # 시각화를 위해 어떤 측면이 사용되었는지 저장
     if right_visible and left_visible:
         final_angles['side_used'] = 'both'
     elif right_visible:
@@ -590,7 +797,7 @@ def determine_best_angles(right_angles, left_angles, landmarks):
     elif left_visible:
         final_angles['side_used'] = 'left'
     else:
-        # Determine which side had better overall visibility
+        # 전체적으로 더 나은 가시성을 가진 측면 결정
         if right_angles['visibility']['overall'] >= left_angles['visibility']['overall']:
             final_angles['side_used'] = 'right'
         else:
@@ -600,8 +807,8 @@ def determine_best_angles(right_angles, left_angles, landmarks):
 
 def calculate_joint_angles(landmarks=None):
     """
-    Calculate joint angles using both left and right sides of the body.
-    Uses the side with better visibility, or averages both sides if both are visible.
+    신체의 양쪽을 모두 사용하여 관절 각도 계산.
+    더 나은 가시성을 가진 쪽을 사용하거나, 양쪽 모두 가시적이면 평균화.
     
     각 관절 각도의 설명:
     - Hip angle: 서 있을 때 약 180°, 스쿼트 시 감소 (torso-hip-knee)
@@ -610,7 +817,7 @@ def calculate_joint_angles(landmarks=None):
     """
     if landmarks is None:
         print("Calculating average angles from stored squat positions...")
-        # Calculate average angles from multiple squat positions
+        # 여러 스쿼트 위치에서 평균 각도 계산
         angles = {
             'hip': [],
             'knee': [],
@@ -624,23 +831,23 @@ def calculate_joint_angles(landmarks=None):
         for pos_idx, position in enumerate(st.session_state.squat_positions):
             lms = position['landmarks']
             
-            # Calculate angles for both sides
+            # 양쪽의 각도 계산
             right_angles = calculate_side_angles(lms, side="right")
             left_angles = calculate_side_angles(lms, side="left")
             
-            # Determine which side to use or average both
+            # 어떤 쪽을 사용할지 결정하거나 양쪽 평균
             final_angles = determine_best_angles(right_angles, left_angles, lms)
             
-            # Add to angle lists
+            # 각도 목록에 추가
             angles['hip'].append(final_angles['hip'])
             angles['knee'].append(final_angles['knee'])
             angles['ankle'].append(final_angles['ankle'])
             sides_used.append(final_angles.get('side_used', 'right'))
                 
-            if pos_idx % 5 == 0:  # Log only some positions
+            if pos_idx % 5 == 0:  # 일부 위치만 로그
                 print(f"  - Position {pos_idx+1}/{position_count} angles: Hip={angles['hip'][-1]:.1f}°, Knee={angles['knee'][-1]:.1f}°, Ankle={angles['ankle'][-1]:.1f}° (Using: {final_angles.get('side_used', 'right')})")
 
-        # Calculate average angles
+        # 평균 각도 계산
         avg_angles = {}
         for joint, values in angles.items():
             if values:
@@ -650,7 +857,7 @@ def calculate_joint_angles(landmarks=None):
                 avg_angles[joint] = 0
                 print(f"  - {joint} angle calculation failed")
         
-        # Determine most used side
+        # 가장 많이 사용된 측면 결정
         if sides_used:
             side_counts = {'right': 0, 'left': 0, 'both': 0}
             for side in sides_used:
@@ -664,18 +871,18 @@ def calculate_joint_angles(landmarks=None):
         return avg_angles
     
     else:
-        # Calculate angles for specific frame for both sides
+        # 양쪽 모두에 대해 특정 프레임의 각도 계산
         right_angles = calculate_side_angles(landmarks, side="right")
         left_angles = calculate_side_angles(landmarks, side="left")
         
-        # Determine which side to use or average both
+        # 어떤 쪽을 사용할지 결정하거나 양쪽 평균
         final_angles = determine_best_angles(right_angles, left_angles, landmarks)
         
         return final_angles
 
 def load_logo():
     """로고 이미지를 로드하는 함수"""
-    logo_dir = os.path.join(st.session_state.base_dir, "logo")
+    logo_dir = os.path.join(STATIC_DIR, "logo")
     print(f"로고 디렉토리 확인: {logo_dir}")
     
     # 로고 디렉토리에서 모든 이미지 파일 검색
@@ -700,13 +907,38 @@ def load_logo():
             print(f"로고 로드 오류: {str(e)}")
             return None
     else:
-        print("로고 파일을 찾을 수 없음")
-        return None
+        # 샘플 로고 생성
+        try:
+            sample_logo = Image.new('RGB', (300, 100), color=(73, 109, 137))
+            
+            # 실행 중 PIL 모듈이 없는 경우 대비
+            try:
+                from PIL import ImageDraw
+                from PIL import ImageFont
+                draw = ImageDraw.Draw(sample_logo)
+                
+                # 기본 폰트 사용
+                draw.text((100, 40), "HealthnAI", fill=(255, 255, 255))
+            except ImportError:
+                pass
+                
+            # 로고 디렉토리 생성
+            os.makedirs(logo_dir, exist_ok=True)
+            
+            # 샘플 로고 저장
+            sample_logo_path = os.path.join(logo_dir, "healthnai_logo.png")
+            sample_logo.save(sample_logo_path)
+            print(f"샘플 로고 생성: {sample_logo_path}")
+            
+            return sample_logo
+        except Exception as e:
+            print(f"샘플 로고 생성 오류: {str(e)}")
+            return None
 
 def generate_angle_comparison_visualization(angles, target_angles):
-    """Generate visualization comparing user's angles to target angles"""
+    """사용자 각도와 목표 각도를 비교하는 시각화 생성"""
     print("Generating angle comparison visualization...")
-    # Data preparation
+    # 데이터 준비
     categories = ['Hip Angle', 'Knee Angle', 'Ankle Angle']
     user_values = [angles['hip'], angles['knee'], angles['ankle']]
     target_values = [target_angles['hip'], target_angles['knee'], target_angles['ankle']]
@@ -714,18 +946,18 @@ def generate_angle_comparison_visualization(angles, target_angles):
     print(f"  - User angles: Hip={user_values[0]:.2f}°, Knee={user_values[1]:.2f}°, Ankle={user_values[2]:.2f}°")
     print(f"  - Target angles: Hip={target_values[0]}°, Knee={target_values[1]}°, Ankle={target_values[2]}°")
     
-    # Create chart
+    # 차트 생성
     fig, ax = plt.subplots(figsize=(12, 7))
     
-    # Bar positions and width
+    # 막대 위치 및 너비
     x = np.arange(len(categories))
     width = 0.35
     
-    # Create bars
+    # 막대 생성
     rects1 = ax.bar(x - width/2, user_values, width, label='Measured Angles', color='skyblue')
     rects2 = ax.bar(x + width/2, target_values, width, label='Target Angles', color='lightgreen')
     
-    # Show differences
+    # 차이 표시
     for i in range(len(categories)):
         diff = user_values[i] - target_values[i]
         color = 'red' if abs(diff) > TOLERANCE else 'green'
@@ -734,14 +966,14 @@ def generate_angle_comparison_visualization(angles, target_angles):
                    ha='center', va='bottom', 
                    color=color, fontweight='bold')
     
-    # Decorate chart
+    # 차트 장식
     ax.set_ylabel('Angle (degrees)', fontsize=12)
     ax.set_title('User Joint Angles vs Target Angles', fontsize=14)
     ax.set_xticks(x)
     ax.set_xticklabels(categories)
     ax.legend()
     
-    # Show tolerance range
+    # 허용 오차 범위 표시
     for i, target in enumerate(target_values):
         ax.axhspan(target - TOLERANCE, target + TOLERANCE, alpha=0.1, color='green', xmin=i/len(categories), xmax=(i+1)/len(categories))
     
@@ -750,12 +982,12 @@ def generate_angle_comparison_visualization(angles, target_angles):
     return fig
 
 def provide_clear_feedback(angles):
-    """Generate clear feedback based on joint angles"""
+    """관절 각도를 기반으로 명확한 피드백 생성"""
     print("Generating posture feedback...")
     feedback = []
     detailed_feedback = []
     
-    # Hip angle feedback - 목표 90도, 서 있을 때 ~180도에서 시작해 감소
+    # 엉덩이 각도 피드백 - 목표 90도, 서 있을 때 ~180도에서 시작해 감소
     hip_diff = angles['hip'] - TARGET_ANGLES['hip']
     if abs(hip_diff) > TOLERANCE:
         if hip_diff > 0:  # 현재 각도가 목표보다 큼 (더 구부려야 함)
@@ -769,7 +1001,7 @@ def provide_clear_feedback(angles):
     else:
         print(f"  - Hip feedback: Within range ({angles['hip']:.1f}° vs {TARGET_ANGLES['hip']}° target)")
     
-    # Knee angle feedback - 목표 90도, 서 있을 때 ~180도에서 시작해 감소
+    # 무릎 각도 피드백 - 목표 90도, 서 있을 때 ~180도에서 시작해 감소
     knee_diff = angles['knee'] - TARGET_ANGLES['knee']
     if abs(knee_diff) > TOLERANCE:
         if knee_diff > 0:  # 현재 각도가 목표보다 큼 (더 구부려야 함)
@@ -783,7 +1015,7 @@ def provide_clear_feedback(angles):
     else:
         print(f"  - Knee feedback: Within range ({angles['knee']:.1f}° vs {TARGET_ANGLES['knee']}° target)")
     
-    # Ankle angle feedback - 목표 25도, 서 있을 때 ~10도 이하에서 시작해 증가
+    # 발목 각도 피드백 - 목표 25도, 서 있을 때 ~10도 이하에서 시작해 증가
     ankle_diff = angles['ankle'] - TARGET_ANGLES['ankle']
     if abs(ankle_diff) > TOLERANCE:
         if ankle_diff > 0:  # 현재 각도가 목표보다 큼 (배측굴곡이 더 큼)
@@ -824,16 +1056,21 @@ def update_angle_explanation():
         """)
 
 # -----------------------------------------------------------------------------------
-# 12) Squat Capture Function
+# 12) 스쿼트 캡처 함수
 # -----------------------------------------------------------------------------------
 def do_capture():
     """
-    Capture squat movements through webcam
-    - Ends after 5 squats or when "Stop Capture" is clicked
-    - Includes 5-second countdown before starting
-    - Saves raw video, annotated video, and CSV with landmarks
+    웹캠을 통한 스쿼트 동작 캡처
+    - 5회 스쿼트 후 또는 "캡처 중지" 클릭 시 종료
+    - 시작 전 5초 카운트다운 포함
+    - 원본 비디오, 주석 처리된 비디오, 랜드마크 CSV 저장
     """
-    # Set active tab
+    if is_cloud_env or not opencv_available:
+        st.error("This feature requires OpenCV and a webcam, which are not available in the cloud environment.")
+        st.info("Please run this application locally for full functionality.")
+        return
+        
+    # 활성 탭 설정
     st.session_state.active_tab = "capture"
     
     print("Starting squat measurement")
@@ -842,20 +1079,20 @@ def do_capture():
         print("Capture aborted: No user registered")
         return
     
-    # Create session ID
+    # 세션 ID 생성
     st.session_state.user_session_id = create_session_id()
     
-    # Create user folders
+    # 사용자 폴더 생성
     user_folders = create_user_folders(st.session_state.current_user)
     
-    # Create container
+    # 컨테이너 생성
     capture_container = st.container()
     
     with capture_container:
         st.header("Squat Motion Capture")
         st.write("Perform 5 squats in front of the camera. Each squat will be automatically recorded.")
         
-        # 5-second countdown
+        # 5초 카운트다운
         st.subheader("Get Ready")
         st.write("Capture will start in 5 seconds.")
         countdown_placeholder = st.empty()
@@ -867,7 +1104,7 @@ def do_capture():
         time.sleep(1)
         countdown_placeholder.empty()
 
-        # Clean up previous resources
+        # 이전 리소스 정리
         if st.session_state.cap is not None:
             st.session_state.cap.release()
             st.session_state.cap = None
@@ -875,14 +1112,14 @@ def do_capture():
             st.session_state.pose.close()
             st.session_state.pose = None
 
-        # Initialize session state
+        # 세션 상태 초기화
         st.session_state.capture_running = True
         st.session_state.current_squat_count = 0
         st.session_state.squat_positions = []
         st.session_state.joint_angles_history = []
         st.session_state.frame_landmarks = []
 
-        # Create video and status display areas
+        # 비디오 및 상태 표시 영역 생성
         col1, col2 = st.columns([3, 1])
         
         with col1:
@@ -893,12 +1130,12 @@ def do_capture():
             status_text = st.empty()
             squat_count_text = st.empty()
             angles_text = st.empty()
-            side_used_text = st.empty()  # New element to show which side is being used
+            side_used_text = st.empty()  # 어떤 측면이 사용되고 있는지 표시하는 새 요소
             st.subheader("Status")
             stop_button_placeholder = st.empty()
             stop_button = stop_button_placeholder.button("Stop Capture", key="stop_capture", use_container_width=True)
 
-        # Initialize MediaPipe Pose
+        # MediaPipe Pose 초기화
         try:
             print("Initializing MediaPipe Pose...")
             st.session_state.pose = mp_pose.Pose(
@@ -915,7 +1152,7 @@ def do_capture():
             st.session_state.capture_running = False
             return
 
-        # Try different camera sources
+        # 다양한 카메라 소스 시도
         camera_sources = [0]
         if SYSTEM == 'Windows':
             camera_sources.extend([1, 2, 3, 4])
@@ -928,7 +1165,7 @@ def do_capture():
             try:
                 print(f"Trying camera source {source}...")
                 st.session_state.cap = cv2.VideoCapture(source)
-                time.sleep(1)  # Wait for camera to initialize
+                time.sleep(1)  # 카메라 초기화 대기
                 
                 ret, frame = st.session_state.cap.read()
                 if ret and frame is not None and frame.shape[0] > 0 and frame.shape[1] > 0:
@@ -950,13 +1187,13 @@ def do_capture():
             st.session_state.capture_running = False
             return
 
-        # Get camera properties
+        # 카메라 속성 가져오기
         width = int(st.session_state.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(st.session_state.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = st.session_state.cap.get(cv2.CAP_PROP_FPS) or 20.0
         print(f"Camera frame info: {width}x{height} @{fps:.1f}fps")
 
-        # Test frame read
+        # 프레임 읽기 테스트
         test_ret, test_frame = st.session_state.cap.read()
         if not test_ret or test_frame is None:
             st.error("Cannot read first frame from camera.")
@@ -969,7 +1206,7 @@ def do_capture():
             print("Camera test image displayed")
             time.sleep(1)
 
-        # Create output files
+        # 출력 파일 생성
         try:
             print("Creating video and CSV files...")
             fourcc = get_video_codec()
@@ -988,14 +1225,15 @@ def do_capture():
             st.session_state.csv_file = open(csv_path, "w", newline="", encoding="utf-8")
             st.session_state.csv_writer = csv.writer(st.session_state.csv_file)
 
-            # Write CSV header
+            # CSV 헤더 작성
+# CSV 헤더 작성
             header = ["frame", "timestamp", "squat_count"]
             for i in range(33):
                 header += [f"lm_{i}_x", f"lm_{i}_y", f"lm_{i}_z", f"lm_{i}_visibility"]
             st.session_state.csv_writer.writerow(header)
             print("CSV header written")
 
-            # Display file save info in an expandable section
+            # 파일 저장 정보를 확장 가능한 섹션에 표시
             with st.expander("📁 File Save Information", expanded=False):
                 st.write(f"**CSV File Path**: `{csv_path}`")
                 st.write(f"**Raw Video Path**: `{video_raw_path}`")
@@ -1007,11 +1245,11 @@ def do_capture():
             st.session_state.capture_running = False
             return
 
-        # Main capture loop
+        # 메인 캡처 루프
         is_squat_down = False
         frame_count = 0
         start_time = time.time()
-        KNEE_ANGLE_THRESHOLD = 120  # Knee bend detection threshold
+        KNEE_ANGLE_THRESHOLD = 120  # 무릎 구부림 감지 임계값
         print(f"Squat detection threshold set: knee angle < {KNEE_ANGLE_THRESHOLD}°")
 
         try:
@@ -1028,30 +1266,30 @@ def do_capture():
                 current_time = time.time() - start_time
 
                 raw_frame = frame.copy()
-                frame = cv2.flip(frame, 1)  # Mirror horizontally
+                frame = cv2.flip(frame, 1)  # 수평으로 미러링
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
                 status_text.write(f"### Status: Measuring")
                 squat_count_text.write(f"Squat Count: **{st.session_state.current_squat_count}/5**")
                 
-                if frame_count % 30 == 0:  # Log every 30 frames
+                if frame_count % 30 == 0:  # 30프레임마다 로그
                     print(f"Processing frame: {frame_count} (Squat count: {st.session_state.current_squat_count}/5)")
 
-                # Process frame with MediaPipe
+                # MediaPipe로 프레임 처리
                 results = st.session_state.pose.process(rgb)
                 annotated_frame = frame.copy()
 
                 if results.pose_landmarks:
-                    # Get landmarks
+                    # 랜드마크 가져오기
                     landmarks = results.pose_landmarks.landmark
                     
-                    # Save to CSV
+                    # CSV에 저장
                     row = [frame_count, current_time, st.session_state.current_squat_count]
                     for lm in landmarks:
                         row += [lm.x, lm.y, lm.z, lm.visibility]
                     st.session_state.csv_writer.writerow(row)
 
-                    # Convert landmarks for easier processing
+                    # 더 쉬운 처리를 위해 랜드마크 변환
                     frame_landmarks = [{
                         'x': lm.x,
                         'y': lm.y,
@@ -1059,7 +1297,7 @@ def do_capture():
                         'visibility': lm.visibility
                     } for lm in landmarks]
 
-                    # Calculate and store angles
+                    # 각도 계산 및 저장
                     frame_angles = calculate_joint_angles(frame_landmarks)
                     st.session_state.joint_angles_history.append({
                         'frame': frame_count,
@@ -1074,7 +1312,7 @@ def do_capture():
                         'squat_count': st.session_state.current_squat_count
                     })
 
-                    # Draw pose landmarks
+                    # 포즈 랜드마크 그리기
                     mp_drawing.draw_landmarks(
                         annotated_frame,
                         results.pose_landmarks,
@@ -1082,13 +1320,13 @@ def do_capture():
                         landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style()
                     )
 
-                    # Get angles
+                    # 각도 가져오기
                     knee_angle = frame_angles['knee']
                     hip_angle = frame_angles['hip']
                     ankle_angle = frame_angles['ankle']
-                    side_used = frame_angles.get('side_used', 'right')  # Default to right if not specified
+                    side_used = frame_angles.get('side_used', 'right')  # 지정되지 않은 경우 오른쪽 기본값
 
-                    # Display angle info
+                    # 각도 정보 표시
                     angles_text.write(f"""
                     **Measured Angles**
                     - Hip: {hip_angle:.1f}°
@@ -1096,13 +1334,13 @@ def do_capture():
                     - Ankle: {ankle_angle:.1f}°
                     """)
                     
-                    # Display which side is being used
+                    # 어떤 측면이 사용되고 있는지 표시
                     side_text = f"Using: {side_used.title()} Side"
                     if side_used == 'both':
                         side_text = "Using: Both Sides (Averaged)"
                     side_used_text.write(f"**{side_text}**")
 
-                    # Add angle text to frame
+                    # 프레임에 각도 텍스트 추가
                     cv2.putText(annotated_frame, f"Hip: {hip_angle:.1f}", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                     cv2.putText(annotated_frame, f"Knee: {knee_angle:.1f}", (10, 60),
@@ -1112,7 +1350,7 @@ def do_capture():
                     cv2.putText(annotated_frame, side_text, (10, 120),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-                    # Squat detection
+                    # 스쿼트 감지
                     if not is_squat_down and knee_angle < KNEE_ANGLE_THRESHOLD:
                         is_squat_down = True
                         status_text.write(f"### Status: Squat down!")
@@ -1124,24 +1362,24 @@ def do_capture():
                         squat_count_text.write(f"Squat Count: **{st.session_state.current_squat_count}/5**")
                         print(f"Squat {st.session_state.current_squat_count} completed! (Knee angle: {knee_angle:.1f}°)")
                         
-                        # Save squat position landmarks
+                        # 스쿼트 자세 랜드마크 저장
                         st.session_state.squat_positions.append({'landmarks': frame_landmarks})
                         print(f"Squat position saved (total: {len(st.session_state.squat_positions)})")
 
-                # Write frames to video
+                # 비디오에 프레임 쓰기
                 st.session_state.out_raw.write(raw_frame)
                 st.session_state.out_annot.write(annotated_frame)
 
-                # Save frame images periodically
-                if frame_count % 10 == 0:  # Every 10 frames
+                # 주기적으로 프레임 이미지 저장
+                if frame_count % 10 == 0:  # 10프레임마다
                     img_filename_raw = os.path.join(user_folders["image"], f"frame_{timestamp}_{frame_count:04d}.jpg")
                     img_filename_annot = os.path.join(user_folders["image_anno"], f"frame_{timestamp}_{frame_count:04d}.jpg")
                     cv2.imwrite(img_filename_raw, raw_frame)
                     cv2.imwrite(img_filename_annot, annotated_frame)
-                    if frame_count % 30 == 0:  # Log every 30 frames
+                    if frame_count % 30 == 0:  # 30프레임마다 로그
                         print(f"Frame images saved: {frame_count:04d} (raw & annotated)")
 
-                # Display the frame
+                # 프레임 표시
                 video_placeholder.image(annotated_frame, channels="BGR", use_column_width=True)
                 stop_button = stop_button_placeholder.button("Stop Capture", key=f"stop_capture_{frame_count}", use_container_width=True)
                 time.sleep(0.01)
@@ -1158,7 +1396,7 @@ def do_capture():
                 st.success("5 squats completed! Click 'Evaluate Squat Posture' to see the results.")
                 print("5 squats completed")
                 
-                # Save angle history
+                # 각도 이력 저장
                 angles_history_path = os.path.join(user_folders["results"], f"angles_history_{timestamp}.csv")
                 angles_df = pd.DataFrame([
                     {
@@ -1167,7 +1405,7 @@ def do_capture():
                         'hip_angle': item['angles']['hip'],
                         'knee_angle': item['angles']['knee'],
                         'ankle_angle': item['angles']['ankle'],
-                        'side_used': item['angles'].get('side_used', 'right'),  # Add side_used information
+                        'side_used': item['angles'].get('side_used', 'right'),  # side_used 정보 추가
                         'squat_count': item['squat_count']
                     }
                     for item in st.session_state.joint_angles_history
@@ -1179,7 +1417,7 @@ def do_capture():
                     st.write(f"**Angle History Saved**: `{angles_history_path}`")
                     st.dataframe(angles_df.head())
                 
-                # Button to go to evaluation page
+                # 평가 페이지로 이동하는 버튼
                 if st.button("Go to Evaluation", key="goto_evaluation"):
                     st.session_state.active_tab = "evaluate"
                     st.rerun()
@@ -1188,16 +1426,76 @@ def do_capture():
                 print(f"Squat stopped: {st.session_state.current_squat_count} squats")
 
 # -----------------------------------------------------------------------------------
-# 13) Squat Evaluation Function (Enhanced with OpenAI)
+# 13) 스쿼트 평가 함수 (OpenAI로 강화)
 # -----------------------------------------------------------------------------------
 def evaluate_squat():
-    """Evaluate squat posture with AI-powered analysis"""
-    # Set active tab
+    """AI 분석을 통한 스쿼트 자세 평가"""
+    if is_cloud_env and not st.session_state.squat_positions:
+        # 클라우드 환경에서 데모 목적으로 샘플 데이터 생성
+        st.info("Running in cloud environment. Loading sample data for demonstration.")
+        
+        # 랜덤 랜드마크로 샘플 스쿼트 위치 생성
+        sample_landmarks = []
+        for _ in range(33):
+            sample_landmarks.append({
+                'x': np.random.uniform(0, 1),
+                'y': np.random.uniform(0, 1),
+                'z': np.random.uniform(0, 1),
+                'visibility': np.random.uniform(0.7, 1.0)
+            })
+        
+        # 합리적인 각도를 보장하기 위해 주요 랜드마크에 특정 값 사용
+        # 오른쪽 측면 랜드마크
+        sample_landmarks[12]['x'], sample_landmarks[12]['y'] = 0.6, 0.3  # 오른쪽 어깨
+        sample_landmarks[24]['x'], sample_landmarks[24]['y'] = 0.55, 0.5  # 오른쪽 엉덩이
+        sample_landmarks[26]['x'], sample_landmarks[26]['y'] = 0.57, 0.7  # 오른쪽 무릎
+        sample_landmarks[28]['x'], sample_landmarks[28]['y'] = 0.52, 0.9  # 오른쪽 발목
+        
+        # 왼쪽 측면 랜드마크
+        sample_landmarks[11]['x'], sample_landmarks[11]['y'] = 0.4, 0.3  # 왼쪽 어깨
+        sample_landmarks[23]['x'], sample_landmarks[23]['y'] = 0.45, 0.5  # 왼쪽 엉덩이
+        sample_landmarks[25]['x'], sample_landmarks[25]['y'] = 0.43, 0.7  # 왼쪽 무릎
+        sample_landmarks[27]['x'], sample_landmarks[27]['y'] = 0.48, 0.9  # 왼쪽 발목
+        
+        # 약간의 변동이 있는 5개의 샘플 위치 생성
+        for i in range(5):
+            varied_landmarks = []
+            for lm in sample_landmarks:
+                # 각 랜드마크에 작은 랜덤 변동 추가
+                varied_landmarks.append({
+                    'x': lm['x'] + np.random.uniform(-0.02, 0.02),
+                    'y': lm['y'] + np.random.uniform(-0.02, 0.02),
+                    'z': lm['z'] + np.random.uniform(-0.02, 0.02),
+                    'visibility': min(1.0, lm['visibility'] + np.random.uniform(-0.05, 0.05))
+                })
+            st.session_state.squat_positions.append({'landmarks': varied_landmarks})
+            
+        # 샘플 관절 각도 이력 생성
+        for i in range(50):
+            frame_landmarks = []
+            for lm in sample_landmarks:
+                # 애니메이션 효과를 위해 더 많은 변동 추가
+                frame_landmarks.append({
+                    'x': lm['x'] + np.random.uniform(-0.05, 0.05),
+                    'y': lm['y'] + np.random.uniform(-0.05, 0.05),
+                    'z': lm['z'] + np.random.uniform(-0.05, 0.05),
+                    'visibility': min(1.0, lm['visibility'] + np.random.uniform(-0.1, 0.1))
+                })
+            
+            angles = calculate_joint_angles(frame_landmarks)
+            st.session_state.joint_angles_history.append({
+                'frame': i,
+                'time': i * 0.1,
+                'angles': angles,
+                'squat_count': min(4, i // 10)
+            })
+    
+    # 활성 탭 설정
     st.session_state.active_tab = "evaluate"
     
     print("Starting squat posture evaluation with AI")
     
-    # Create evaluation container
+    # 평가 컨테이너 생성
     eval_container = st.container()
     
     with eval_container:
@@ -1217,11 +1515,11 @@ def evaluate_squat():
         timestamp = st.session_state.user_session_id or create_session_id()
         print(f"Evaluation timestamp: {timestamp}, positions: {len(st.session_state.squat_positions)}")
 
-        # Calculate joint angles
+        # 관절 각도 계산
         angles = calculate_joint_angles()
         st.session_state.squat_results = angles
 
-        # Display angle analysis
+        # 각도 분석 표시
         st.subheader("Joint Angle Analysis Results (Average)")
         data = []
         joint_names = {
@@ -1244,24 +1542,24 @@ def evaluate_squat():
         df = pd.DataFrame(data, columns=["Metric", "Target", "Measured", "Difference"])
         st.table(df)
         
-        # Show which side was used for measurements
+        # 측정에 사용된 측면 표시
         if 'side_used' in angles:
             side_text = f"Using measurements from: {angles['side_used'].title()} Side"
             if angles['side_used'] == 'both':
                 side_text = "Using measurements from: Both Sides (Averaged)"
             st.info(side_text)
 
-        # Save results
+        # 결과 저장
         result_csv_path = os.path.join(user_folders["results"], f"squat_results_{timestamp}.csv")
         df.to_csv(result_csv_path, index=False)
         print(f"Evaluation results saved: {result_csv_path}")
         with st.expander("📁 Result File Information", expanded=False):
             st.write(f"Results saved to: `{result_csv_path}`")
 
-        # Explanation of angles
+        # 각도 설명
         update_angle_explanation()
 
-        # Angle comparison visualization
+        # 각도 비교 시각화
         st.subheader("Angle Comparison Visualization")
         comparison_fig = generate_angle_comparison_visualization(angles, TARGET_ANGLES)
         st.pyplot(comparison_fig)
@@ -1269,23 +1567,32 @@ def evaluate_squat():
         comparison_fig.savefig(comparison_fig_path, dpi=150, bbox_inches='tight')
         print(f"Angle comparison visualization saved: {comparison_fig_path}")
 
-        # AI Analysis Section
+        # AI 분석 섹션
         st.subheader("💡 AI Posture Analysis")
         
         if st.session_state.ai_analysis is None:
             with st.spinner("AI is analyzing your squat posture... this may take a moment."):
-                st.session_state.ai_analysis = get_ai_analysis(angles, TARGET_ANGLES, TOLERANCE)
+                if OPENAI_API_KEY:
+                    st.session_state.ai_analysis = get_ai_analysis(angles, TARGET_ANGLES, TOLERANCE)
+                else:
+                    st.session_state.ai_analysis = """
+                    ## AI Analysis Not Available
+                    
+                    To receive AI-powered analysis of your squat form, please add your OpenAI API key in the sidebar.
+                    
+                    The AI analysis provides detailed feedback on your posture, specific corrections, and personalized exercise recommendations.
+                    """
                 
-                # Save the AI analysis
+                # AI 분석 저장
                 ai_analysis_path = os.path.join(user_folders["results"], f"ai_analysis_{timestamp}.txt")
                 with open(ai_analysis_path, 'w', encoding='utf-8') as f:
                     f.write(st.session_state.ai_analysis)
                 print(f"AI analysis saved to: {ai_analysis_path}")
         
-        # Display AI analysis with nicer formatting
+        # 더 나은 형식으로 AI 분석 표시
         st.markdown(st.session_state.ai_analysis)
 
-        # Basic feedback
+        # 기본 피드백
         st.subheader("Quick Feedback Summary")
         feedback, detailed_feedback = provide_clear_feedback(angles)
         
@@ -1296,7 +1603,7 @@ def evaluate_squat():
         else:
             st.success("All joint angles are within the target range. Excellent squat posture!")
 
-        # Angle change graph
+        # 각도 변화 그래프
         if st.session_state.joint_angles_history:
             print(f"Generating angle change graph (data points: {len(st.session_state.joint_angles_history)})")
             st.subheader("Joint Angle Changes During Squat Exercise")
@@ -1306,20 +1613,20 @@ def evaluate_squat():
                     'hip_angle': item['angles']['hip'],
                     'knee_angle': item['angles']['knee'],
                     'ankle_angle': item['angles']['ankle'],
-                    'side_used': item['angles'].get('side_used', 'right'),  # Add side used information
+                    'side_used': item['angles'].get('side_used', 'right'),  # side used 정보 추가
                     'squat_count': item['squat_count']
                 }
                 for item in st.session_state.joint_angles_history
             ])
             
-            # Data summary statistics
+            # 데이터 요약 통계
             print(f"Angle data summary:")
             print(f"  - Time range: {df_angles['time'].min():.1f}s ~ {df_angles['time'].max():.1f}s")
             print(f"  - Hip angle range: {df_angles['hip_angle'].min():.1f}° ~ {df_angles['hip_angle'].max():.1f}°")
             print(f"  - Knee angle range: {df_angles['knee_angle'].min():.1f}° ~ {df_angles['knee_angle'].max():.1f}°")
             print(f"  - Ankle angle range: {df_angles['ankle_angle'].min():.1f}° ~ {df_angles['ankle_angle'].max():.1f}°")
             
-            # Show side distribution
+            # 측면 분포 표시
             side_counts = df_angles['side_used'].value_counts()
             print(f"  - Side used distribution: {side_counts.to_dict()}")
             
@@ -1337,7 +1644,7 @@ def evaluate_squat():
             ax.axhline(y=TARGET_ANGLES['knee']+1, color='green', linestyle='-.', linewidth=3, alpha=0.8, label='Target Knee Angle')
             ax.axhline(y=TARGET_ANGLES['ankle'], color='blue', linestyle=':', linewidth=3, alpha=0.8, label='Target Ankle Angle')
             
-            # Mark squat transitions
+            # 스쿼트 전환 표시
             squat_changes = df_angles.loc[df_angles['squat_count'].diff() != 0]
             for idx, row in squat_changes.iterrows():
                 ax.axvline(x=row['time'], color='gray', linestyle='-', alpha=0.3)
@@ -1351,13 +1658,13 @@ def evaluate_squat():
             ax.legend(fontsize=12, loc='upper right')
             ax.grid(True, alpha=0.3)
             
-            # Save and display
+            # 저장 및 표시
             angles_plot_path = os.path.join(user_folders["results"], f"angles_plot_{timestamp}.png")
             plt.savefig(angles_plot_path, dpi=150, bbox_inches='tight')
             print(f"Angle change graph saved: {angles_plot_path}")
             st.pyplot(fig)
             
-            # Show side distribution in a pie chart
+            # 측면 분포를 파이 차트로 표시
             st.subheader("Measurement Side Distribution")
             fig_pie, ax_pie = plt.subplots(figsize=(6, 6))
             side_counts.plot.pie(autopct='%1.1f%%', ax=ax_pie, title='Body Side Used for Measurements')
@@ -1365,7 +1672,7 @@ def evaluate_squat():
             plt.savefig(pie_path, dpi=150, bbox_inches='tight')
             st.pyplot(fig_pie)
 
-        # Information on squat measurement principles
+        # 스쿼트 측정 원리에 관한 정보
         with st.expander("📚 Squat Measurement Principles", expanded=False):
             st.write("""
             ## Squat Measurement Principles
@@ -1381,41 +1688,42 @@ def evaluate_squat():
             Collected data is converted into graphs and visual materials to provide intuitive feedback.
             """)
 
-        # Joint angle distribution histograms
-        st.subheader("Joint Angle Distribution Histograms")
-        print("Generating angle distribution histograms")
-        bins = 20
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        
-        # Create histograms
-        sns.histplot(df_angles['hip_angle'], kde=True, bins=bins, ax=axes[0])
-        axes[0].axvline(TARGET_ANGLES['hip'], color='r', linestyle='--')
-        axes[0].set_title('Hip Angle Distribution')
-        
-        sns.histplot(df_angles['knee_angle'], kde=True, bins=bins, ax=axes[1])
-        axes[1].axvline(TARGET_ANGLES['knee'], color='r', linestyle='--')
-        axes[1].set_title('Knee Angle Distribution')
-        
-        sns.histplot(df_angles['ankle_angle'], kde=True, bins=bins, ax=axes[2])
-        axes[2].axvline(TARGET_ANGLES['ankle'], color='r', linestyle='--')
-        axes[2].set_title('Ankle Dorsiflexion Distribution')
-        
-        plt.tight_layout()
-        
-        # Save and display
-        heatmap_path = os.path.join(user_folders["results"], f"angle_heatmap_{timestamp}.png")
-        plt.savefig(heatmap_path, dpi=150, bbox_inches='tight')
-        print(f"Angle distribution histograms saved: {heatmap_path}")
-        st.pyplot(fig)
+        # 관절 각도 분포 히스토그램
+        if len(df_angles) > 0:
+            st.subheader("Joint Angle Distribution Histograms")
+            print("Generating angle distribution histograms")
+            bins = 20
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            
+            # 히스토그램 생성
+            sns.histplot(df_angles['hip_angle'], kde=True, bins=bins, ax=axes[0])
+            axes[0].axvline(TARGET_ANGLES['hip'], color='r', linestyle='--')
+            axes[0].set_title('Hip Angle Distribution')
+            
+            sns.histplot(df_angles['knee_angle'], kde=True, bins=bins, ax=axes[1])
+            axes[1].axvline(TARGET_ANGLES['knee'], color='r', linestyle='--')
+            axes[1].set_title('Knee Angle Distribution')
+            
+            sns.histplot(df_angles['ankle_angle'], kde=True, bins=bins, ax=axes[2])
+            axes[2].axvline(TARGET_ANGLES['ankle'], color='r', linestyle='--')
+            axes[2].set_title('Ankle Dorsiflexion Distribution')
+            
+            plt.tight_layout()
+            
+            # 저장 및 표시
+            heatmap_path = os.path.join(user_folders["results"], f"angle_heatmap_{timestamp}.png")
+            plt.savefig(heatmap_path, dpi=150, bbox_inches='tight')
+            print(f"Angle distribution histograms saved: {heatmap_path}")
+            st.pyplot(fig)
 
-        # Calculate scores
+        # 점수 계산
         hip_score = max(0, 10 - abs(angles['hip'] - TARGET_ANGLES['hip'])) / 10 * 100
         knee_score = max(0, 10 - abs(angles['knee'] - TARGET_ANGLES['knee'])) / 10 * 100
         ankle_score = max(0, 10 - abs(angles['ankle'] - TARGET_ANGLES['ankle'])) / 10 * 100
         overall_score = (hip_score * 0.4) + (knee_score * 0.4) + (ankle_score * 0.2)
         print(f"Score calculation: Hip={hip_score:.1f}, Knee={knee_score:.1f}, Ankle={ankle_score:.1f}, Overall={overall_score:.1f}")
 
-        # Display scores
+        # 점수 표시
         st.subheader("Overall Evaluation Score")
         score_col1, score_col2, score_col3, score_col4 = st.columns(4)
         with score_col1:
@@ -1427,7 +1735,7 @@ def evaluate_squat():
         with score_col4:
             st.metric("Overall Score", f"{overall_score:.1f}")
         
-        # Save scores
+        # 점수 저장
         scores_df = pd.DataFrame({
             'hip_score': [hip_score],
             'knee_score': [knee_score],
@@ -1437,7 +1745,7 @@ def evaluate_squat():
         scores_df.to_csv(os.path.join(user_folders["results"], f"scores_{timestamp}.csv"), index=False)
         print(f"Scores saved: {os.path.join(user_folders['results'], f'scores_{timestamp}.csv')}")
 
-        # Create radar chart
+        # 레이더 차트 생성
         st.subheader("Strengths/Weaknesses Analysis (Radar Chart)")
         print("Generating radar chart...")
         categories = ['Hip', 'Knee', 'Ankle']
@@ -1454,7 +1762,7 @@ def evaluate_squat():
         ax.plot(angles, scores, 'o-', linewidth=2, label='User Score')
         ax.fill(angles, scores, alpha=0.25)
         
-        ideal_scores = [1.0] * len(categories)
+        ideal_scores = [1.0] * (len(categories)+1)
         ax.plot(angles, ideal_scores, 'o-', linewidth=2, label='Ideal Score')
         ax.fill(angles, ideal_scores, alpha=0.1)
         
@@ -1463,31 +1771,35 @@ def evaluate_squat():
         ax.grid(True)
         ax.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1))
         
-        # Save and display
+        # 저장 및 표시
         radar_chart_path = os.path.join(user_folders["results"], f"radar_chart_{timestamp}.png")
         plt.savefig(radar_chart_path, dpi=150, bbox_inches='tight')
         print(f"Radar chart saved: {radar_chart_path}")
         st.pyplot(fig)
 
-        # Final info and navigation button
+        # 최종 정보 및 탐색 버튼
         st.write("Evaluation complete! Now you can check the 'Custom Guide' tab for personalized squat guidance with AI-generated visuals.")
         
-        # Button to go to custom guide page
+        # 사용자 정의 가이드 페이지로 이동하는 버튼
         if st.button("Go to Custom Guide", key="goto_guide"):
             st.session_state.active_tab = "guide"
             st.rerun()
 
 # -----------------------------------------------------------------------------------
-# 14) Custom Guide Function with DALL-E Image Generation
+# 14) DALL-E 이미지 생성이 포함된 사용자 정의 가이드 함수
 # -----------------------------------------------------------------------------------
 def generate_squat_guide():
-    """Generate personalized squat guide with AI analysis and DALL-E visualization"""
-    # Set active tab
+    """AI 분석 및 DALL-E 시각화를 통한 개인화된 스쿼트 가이드 생성"""
+    # 기존 데이터가 없는 클라우드 환경의 경우
+    if is_cloud_env and not st.session_state.squat_results:
+        evaluate_squat()  # 샘플 데이터 생성 및 평가
+        
+    # 활성 탭 설정
     st.session_state.active_tab = "guide"
     
     print("Starting personalized squat guide generation with AI")
     
-    # Create guide container
+    # 가이드 컨테이너 생성
     guide_container = st.container()
     
     with guide_container:
@@ -1505,23 +1817,23 @@ def generate_squat_guide():
         timestamp = st.session_state.user_session_id or create_session_id()
         print(f"Generating AI squat guide for {user_name}")
         
-        # Show which body side was used for the analysis
+        # 분석에 사용된 신체 측면 표시
         if 'side_used' in angles:
             side_text = f"Analysis based on: {angles['side_used'].title()} Side"
             if angles['side_used'] == 'both':
                 side_text = "Analysis based on: Both Sides (Averaged)"
             st.info(side_text)
 
-        # Show AI analysis from evaluation if available
+        # 가능한 경우 평가에서 AI 분석 표시
         if st.session_state.ai_analysis:
             st.subheader(f"🧠 AI Analysis for {user_name}")
             st.markdown(st.session_state.ai_analysis)
         
-        # Generate personalized visual guide with DALL-E
+        # DALL-E로 개인화된 시각적 가이드 생성
         st.subheader("🖼️ Personalized Squat Visualization")
         
-        if st.session_state.generated_image is None:
-            # Identify main issue
+        if st.session_state.generated_image is None and openai_available and OPENAI_API_KEY:
+            # 주요 문제 식별
             issues = []
             if abs(angles['hip'] - TARGET_ANGLES['hip']) > TOLERANCE:
                 diff = angles['hip'] - TARGET_ANGLES['hip']
@@ -1546,7 +1858,7 @@ def generate_squat_guide():
 
             print(f"Identified issues: {len(issues)}")
             
-            # Prepare DALL-E prompt based on analysis
+            # 분석 기반 DALL-E 프롬프트 준비
             if issues:
                 main_issue = issues[0]
                 image_prompt = f"""
@@ -1576,7 +1888,7 @@ def generate_squat_guide():
                 Make it suitable for a fitness instruction guide.
                 """
             
-            # Generate image with DALL-E
+            # DALL-E로 이미지 생성
             with st.spinner("Generating personalized squat guide image... this may take a moment."):
                 image, image_url = generate_dalle_image(image_prompt)
                 if image:
@@ -1584,18 +1896,22 @@ def generate_squat_guide():
                     image_path = os.path.join(user_folders["ai_images"], f"squat_guide_image_{timestamp}.png")
                     image.save(image_path)
                     print(f"Squat guide image saved: {image_path}")
+                else:
+                    st.error("Image generation failed. Please check your OpenAI API key.")
         
-        # Display the generated image
+        # 생성된 이미지 표시
         if st.session_state.generated_image:
             st.image(st.session_state.generated_image, caption="AI-Generated Personalized Squat Guide", use_column_width=True)
         else:
-            st.warning("⚠️ Image generation failed. Check your OpenAI API key and connection.")
-            print("Image generation failed")
+            if not OPENAI_API_KEY:
+                st.warning("⚠️ OpenAI API key not provided. Add your API key in the sidebar to generate personalized images.")
+            else:
+                st.warning("⚠️ Image generation failed or unavailable in this environment.")
             
-            # Show text-based guidance instead
+            # 대신 텍스트 기반 가이드 표시
             st.subheader("📋 Text-Based Guidance")
             st.markdown("""
-            Since the image generation failed, here's a text-based guide instead:
+            Here's a text-based guide for proper squat form:
             
             1. **Foot Position**: Stand with feet shoulder-width apart, toes pointed slightly outward (15-30°)
             2. **Hip Hinge**: Begin the movement by pushing your hips back as if sitting in a chair
@@ -1606,15 +1922,15 @@ def generate_squat_guide():
             7. **Ankle Mobility**: Allow appropriate ankle dorsiflexion (about 25°) while keeping heels on the ground
             """)
         
-        # Key points
+        # 주요 포인트
         st.subheader("💡 Key Points for Improvement")
         
-        # Identify areas for improvement
+        # 개선 영역 식별
         hip_diff = angles['hip'] - TARGET_ANGLES['hip']
         knee_diff = angles['knee'] - TARGET_ANGLES['knee']
         ankle_diff = angles['ankle'] - TARGET_ANGLES['ankle']
         
-        # Create columns for layout
+        # 레이아웃을 위한 열 생성
         col1, col2 = st.columns(2)
         
         with col1:
@@ -1682,10 +1998,10 @@ def generate_squat_guide():
                 st.markdown("- Start with bodyweight before adding load")
                 st.markdown("- Consider working with a coach")
         
-        # Supplementary exercises section
+        # 보충 운동 섹션
         st.subheader("💪 Recommended Supplementary Exercises")
         
-        # Based on identified issues, recommend specific exercises
+        # 식별된 문제에 따라 특정 운동 추천
         with st.expander("View Recommended Exercises", expanded=True):
             if abs(hip_diff) > TOLERANCE:
                 st.markdown("#### Hip Mobility & Strength")
@@ -1719,7 +2035,7 @@ def generate_squat_guide():
                 3. **Pause Squats**: Add isometric holds at the bottom to build strength and control
                 """)
         
-        # Follow-up recommendations
+        # 후속 권장 사항
         with st.expander("📋 Next Steps", expanded=True):
             st.markdown("""
             ### Follow-up Recommendations
@@ -1737,35 +2053,50 @@ def generate_squat_guide():
         print("AI squat guide generation complete")
 
 # -----------------------------------------------------------------------------------
-# 15) Main Application Layout
+# 15) 메인 애플리케이션 레이아웃
 # -----------------------------------------------------------------------------------
 def main():
-    """Main application layout and interaction logic"""
+    """메인 애플리케이션 레이아웃 및 상호작용 로직"""
     print("Loading user information...")
     st.session_state.users = load_users()
     
-    # Declare global variables at the beginning of the function
-    global OPENAI_API_KEY, client
+    # 클라우드 환경 경고 표시
+    if is_cloud_env:
+        st.warning("""
+        ⚠️ Running in cloud environment - Camera capture features are disabled.
+        
+        For full functionality including real-time squat analysis with webcam, please run this application locally.
+        
+        Demo mode is enabled with sample data for evaluation and guide features.
+        """)
     
-    # Center-aligned logo
+    # 중앙 정렬 로고
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         logo_img = load_logo()
         if logo_img:
             st.image(logo_img, width=300, use_column_width=True)
         else:
-            st.info("로고 이미지를 찾을 수 없습니다. 로고 폴더를 확인하세요.")
+            st.markdown("<div style='text-align: center;'><h2>HealthnAI Squat Analysis</h2></div>", unsafe_allow_html=True)
 
     st.title("AI Squat Analysis")
     st.markdown("---")
 
-    # API Key input in sidebar
+    # 사이드바에 API 키 입력
     with st.sidebar:
         st.subheader("OpenAI API Settings")
         api_key = st.text_input("Enter OpenAI API Key", value=OPENAI_API_KEY, type="password")
         if api_key != OPENAI_API_KEY:
+            os.environ["OPENAI_API_KEY"] = api_key
+            global OPENAI_API_KEY
             OPENAI_API_KEY = api_key
-            client = OpenAI(api_key=OPENAI_API_KEY)
+            # 새 API 키로 클라이언트 재초기화
+            if openai_new_client:
+                global client
+                client = OpenAI(api_key=OPENAI_API_KEY)
+            else:
+                import openai
+                openai.api_key = OPENAI_API_KEY
             st.success("API key updated")
         
         st.markdown("---")
@@ -1780,11 +2111,11 @@ def main():
         """)
 
 
-    # Create tabs
+    # 탭 생성
     tabs = ["User Management", "Squat Measurement", "Posture Evaluation", "Custom Guide"]
     active_tab = st.session_state.active_tab if "active_tab" in st.session_state else "user"
     
-    # Calculate tab index
+    # 탭 인덱스 계산
     tab_index = 0
     if active_tab == "capture":
         tab_index = 1
@@ -1795,7 +2126,7 @@ def main():
     
     tab1, tab2, tab3, tab4 = st.tabs(tabs)
     
-    # User Management Tab
+    # 사용자 관리 탭
     with tab1:
         st.header("User Management")
         
@@ -1836,7 +2167,7 @@ def main():
                 if st.button("Select", use_container_width=True):
                     selected_user_id = user_options[selected_user_display]
                     st.session_state.current_user = selected_user_id
-                    # Reset AI analysis and image when switching users
+                    # 사용자 전환 시 AI 분석 및 이미지 초기화
                     st.session_state.ai_analysis = None
                     st.session_state.generated_image = None
                     st.success(f"✅ Selected user: {st.session_state.users[selected_user_id]['name']}")
@@ -1845,7 +2176,7 @@ def main():
                 st.info("📝 No registered users. Please register a user first.")
                 print("No registered users")
 
-        # Display current user info
+        # 현재 사용자 정보 표시
         st.markdown("---")
         if st.session_state.current_user:
             user_info = st.session_state.users[st.session_state.current_user]
@@ -1863,51 +2194,82 @@ def main():
         else:
             st.warning("⚠️ Please select or register a user.")
 
-    # Squat Measurement Tab
+    # 스쿼트 측정 탭
     with tab2:
         st.header("Squat Measurement")
         
-        if not st.session_state.current_user:
-            st.warning("⚠️ Please register or select a user first.")
-        else:
+        if is_cloud_env:
+            st.info("💻 This feature requires a local environment with webcam access.")
             st.markdown("""
-            This feature measures your squat movement in real-time through the webcam. Click the Start button and perform 5 squats.
-            The camera will detect your squat posture and analyze the angles of each joint in real-time.
+            In a local environment, this tab would allow you to:
+            1. Capture real-time video from your webcam
+            2. Track your squat movement using computer vision
+            3. Record 5 squats and analyze each repetition
+            4. Save your squat data for detailed evaluation
+            
+            To use this feature, please run this application locally.
             """)
             
-            if st.button("📸 Start Squat Measurement", use_container_width=True):
-                print(f"Starting squat measurement (user: {st.session_state.users[st.session_state.current_user]['name']})")
-                do_capture()
-                
-            # Display measurement status and results
-            if st.session_state.current_squat_count > 0:
-                st.success(f"✅ {st.session_state.current_squat_count} squats measured")
-                if st.button("📊 Evaluate Squat Posture with AI", use_container_width=True):
+            # 데모 목적의 샘플 데이터 버튼
+            if st.session_state.current_user:
+                if st.button("Generate Sample Data (Demo)", use_container_width=True):
+                    # 세션 ID 생성
+                    st.session_state.user_session_id = create_session_id()
+                    # 카운터 초기화
+                    st.session_state.current_squat_count = 5
+                    st.session_state.squat_positions = []
+                    st.session_state.joint_angles_history = []
+                    
+                    # 샘플 데이터를 생성하고 표시하기 위해 evaluate_squat 호출
                     st.session_state.active_tab = "evaluate"
                     st.rerun()
-            
-            with st.expander("ℹ️ Measurement Instructions", expanded=False):
+            else:
+                st.warning("⚠️ Please register or select a user first.")
+        else:
+            if not st.session_state.current_user:
+                st.warning("⚠️ Please register or select a user first.")
+            else:
                 st.markdown("""
-                ### How to Measure
-                1. Click the Start button and prepare in front of the camera.
-                2. After a 5-second countdown, measurement will begin.
-                3. Position yourself 2-3m from the camera so your full body is visible.
-                4. Perform 5 squats at a comfortable pace.
-                5. Once complete, you can proceed to AI-powered posture evaluation.
-                
-                ### Tips
-                - Side view provides more accurate analysis.
-                - Wear clothing that allows joints to be visible and movement to be unrestricted.
-                - Place feet at shoulder width with toes pointed slightly outward.
+                This feature measures your squat movement in real-time through the webcam. Click the Start button and perform 5 squats.
+                The camera will detect your squat posture and analyze the angles of each joint in real-time.
                 """)
+                
+                if not opencv_available:
+                    st.error("OpenCV and/or MediaPipe libraries are not available. Please install them to use this feature.")
+                else:
+                    if st.button("📸 Start Squat Measurement", use_container_width=True):
+                        print(f"Starting squat measurement (user: {st.session_state.users[st.session_state.current_user]['name']})")
+                        do_capture()
+                    
+                # 측정 상태 및 결과 표시
+                if st.session_state.current_squat_count > 0:
+                    st.success(f"✅ {st.session_state.current_squat_count} squats measured")
+                    if st.button("📊 Evaluate Squat Posture with AI", use_container_width=True):
+                        st.session_state.active_tab = "evaluate"
+                        st.rerun()
+                
+                with st.expander("ℹ️ Measurement Instructions", expanded=False):
+                    st.markdown("""
+                    ### How to Measure
+                    1. Click the Start button and prepare in front of the camera.
+                    2. After a 5-second countdown, measurement will begin.
+                    3. Position yourself 2-3m from the camera so your full body is visible.
+                    4. Perform 5 squats at a comfortable pace.
+                    5. Once complete, you can proceed to AI-powered posture evaluation.
+                    
+                    ### Tips
+                    - Side view provides more accurate analysis.
+                    - Wear clothing that allows joints to be visible and movement to be unrestricted.
+                    - Place feet at shoulder width with toes pointed slightly outward.
+                    """)
 
-    # Posture Evaluation Tab
+    # 자세 평가 탭
     with tab3:
         st.header("AI Squat Posture Evaluation")
         
         if not st.session_state.current_user:
             st.warning("⚠️ Please register or select a user first.")
-        elif st.session_state.current_squat_count == 0:
+        elif not is_cloud_env and st.session_state.current_squat_count == 0:
             st.warning("⚠️ Please complete squat measurement first.")
         else:
             st.markdown("""
@@ -1916,12 +2278,12 @@ def main():
             """)
             
             if st.button("🔍 Start AI Posture Evaluation", use_container_width=True):
-                # Reset AI analysis to ensure fresh analysis
+                # 새로운 분석을 보장하기 위해 AI 분석 초기화
                 st.session_state.ai_analysis = None
-                print(f"Starting squat evaluation (squats: {st.session_state.current_squat_count})")
+                print(f"Starting squat evaluation")
                 evaluate_squat()
                 
-            # If evaluation results exist, show guide button
+            # 평가 결과가 있으면 가이드 버튼 표시
             if st.session_state.squat_results:
                 if st.button("🧠 View AI-Generated Guide", use_container_width=True):
                     st.session_state.active_tab = "guide"
@@ -1944,13 +2306,13 @@ def main():
                 5. **Personalized Feedback**: Custom advice based on your specific body mechanics.
                 """)
 
-    # Custom Guide Tab
+    # 사용자 정의 가이드 탭
     with tab4:
         st.header("AI-Generated Custom Squat Guide")
         
         if not st.session_state.current_user:
             st.warning("⚠️ Please register or select a user first.")
-        elif not st.session_state.squat_results:
+        elif not is_cloud_env and not st.session_state.squat_results:
             st.warning("⚠️ Please complete squat evaluation first.")
         else:
             st.markdown("""
@@ -1959,7 +2321,7 @@ def main():
             """)
             
             if st.button("🧠 Generate AI Squat Guide & Visualization", use_container_width=True):
-                print(f"Generating AI squat guide (user: {st.session_state.users[st.session_state.current_user]['name']})")
+                print(f"Generating AI squat guide")
                 generate_squat_guide()
                 
             with st.expander("ℹ️ About AI Guide Features", expanded=False):
@@ -1979,6 +2341,10 @@ def main():
                 5. **Professional Expertise**: Guidance based on professional coaching principles.
                 """)
 
-# Run the main application
+# 메인 애플리케이션 실행
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        st.error(f"An error occurred: {str(e)}")
+        st.error(traceback.format_exc())
